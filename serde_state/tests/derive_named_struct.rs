@@ -798,3 +798,222 @@ fn recursive_enum_threads_state() {
     assert_eq!(decoded, list);
     assert_eq!(state.deserialized.get(), 2);
 }
+
+#[test]
+fn postcard_named_struct_deserializes_from_seq_and_threads_state() {
+    let value = Example {
+        first: CounterValue(31),
+        second: CounterValue(32),
+    };
+
+    let ser_state = Recorder::default();
+    let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+        &value, &ser_state,
+    ))
+    .expect("postcard serialize named struct");
+    assert_eq!(ser_state.serialized.get(), 2);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded = Example::deserialize_state(&de_state, &mut deserializer)
+        .expect("postcard deserialize named struct");
+    assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+    assert_eq!(decoded, value);
+    assert_eq!(de_state.deserialized.get(), 2);
+}
+
+#[test]
+fn postcard_struct_variant_deserializes_from_seq_and_threads_state() {
+    let value = Action::Record {
+        first: CounterValue(41),
+        second: CounterValue(42),
+    };
+
+    let ser_state = Recorder::default();
+    let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+        &value, &ser_state,
+    ))
+    .expect("postcard serialize struct variant");
+    assert_eq!(ser_state.serialized.get(), 2);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded = Action::deserialize_state(&de_state, &mut deserializer)
+        .expect("postcard deserialize struct variant");
+    assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+    assert_eq!(decoded, value);
+    assert_eq!(de_state.deserialized.get(), 2);
+}
+
+#[test]
+fn postcard_enum_variants_deserialize_from_numeric_tags() {
+    fn round_trip(value: Action, expected_hits: usize) {
+        let ser_state = Recorder::default();
+        let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+            &value, &ser_state,
+        ))
+        .expect("postcard serialize enum");
+        assert_eq!(ser_state.serialized.get(), expected_hits);
+
+        let de_state = Recorder::default();
+        let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+        let decoded = Action::deserialize_state(&de_state, &mut deserializer)
+            .expect("postcard deserialize enum");
+        assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+        assert_eq!(decoded, value);
+        assert_eq!(de_state.deserialized.get(), expected_hits);
+    }
+
+    round_trip(Action::Idle, 0);
+    round_trip(Action::Reset(CounterValue(51)), 1);
+    round_trip(Action::Combine(CounterValue(52), CounterValue(53)), 2);
+    round_trip(
+        Action::Record {
+            first: CounterValue(54),
+            second: CounterValue(55),
+        },
+        2,
+    );
+}
+
+#[test]
+fn postcard_named_struct_rejects_truncated_input() {
+    let value = Example {
+        first: CounterValue(61),
+        second: CounterValue(62),
+    };
+    let state = Recorder::default();
+    let mut bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(&value, &state))
+        .expect("postcard serialize named struct");
+    bytes.pop();
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let result = Example::deserialize_state(&de_state, &mut deserializer);
+    assert!(result.is_err(), "truncated postcard should fail");
+}
+
+#[test]
+fn postcard_named_struct_leaves_trailing_bytes_unconsumed() {
+    let value = Example {
+        first: CounterValue(71),
+        second: CounterValue(72),
+    };
+    let state = Recorder::default();
+    let mut bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(&value, &state))
+        .expect("postcard serialize named struct");
+    bytes.push(0x01);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded =
+        Example::deserialize_state(&de_state, &mut deserializer).expect("struct should decode");
+    assert_eq!(decoded, value);
+    let rem = deserializer.finalize().expect("postcard remainder");
+    assert_eq!(rem.len(), 1, "one trailing byte should remain");
+}
+
+#[test]
+fn postcard_struct_variant_leaves_trailing_bytes_unconsumed() {
+    let value = Action::Record {
+        first: CounterValue(81),
+        second: CounterValue(82),
+    };
+    let state = Recorder::default();
+    let mut bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(&value, &state))
+        .expect("postcard serialize struct variant");
+    bytes.push(0x00);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded =
+        Action::deserialize_state(&de_state, &mut deserializer).expect("variant should decode");
+    assert_eq!(decoded, value);
+    let rem = deserializer.finalize().expect("postcard remainder");
+    assert_eq!(rem.len(), 1, "one trailing byte should remain");
+}
+
+#[test]
+fn postcard_enum_rejects_unknown_numeric_variant_tag() {
+    let value = Action::Idle;
+    let state = Recorder::default();
+    let mut bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(&value, &state))
+        .expect("postcard serialize enum");
+    bytes[0] = 0x7f;
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let result = Action::deserialize_state(&de_state, &mut deserializer);
+    assert!(
+        result.is_err(),
+        "unknown numeric variant tag should fail for enum"
+    );
+}
+
+#[test]
+fn postcard_named_struct_with_helper_round_trips() {
+    let value = WithHelperField {
+        counter: CounterValue(91),
+    };
+
+    let ser_state = Recorder::default();
+    let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+        &value, &ser_state,
+    ))
+    .expect("postcard serialize helper field");
+    assert_eq!(ser_state.serialized.get(), 0);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded = WithHelperField::deserialize_state(&de_state, &mut deserializer)
+        .expect("postcard deserialize helper field");
+    assert_eq!(decoded, value);
+    assert_eq!(de_state.deserialized.get(), 0);
+    assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+}
+
+#[test]
+fn postcard_named_struct_with_skipped_field_uses_default() {
+    let value = RenamedAndSkipped {
+        renamed: CounterValue(92),
+        skipped: PlainValue(999),
+    };
+
+    let ser_state = Recorder::default();
+    let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+        &value, &ser_state,
+    ))
+    .expect("postcard serialize skipped field");
+    assert_eq!(ser_state.serialized.get(), 1);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded = RenamedAndSkipped::deserialize_state(&de_state, &mut deserializer)
+        .expect("postcard deserialize skipped field");
+    assert_eq!(decoded.renamed, CounterValue(92));
+    assert_eq!(decoded.skipped, PlainValue(0));
+    assert_eq!(de_state.deserialized.get(), 1);
+    assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+}
+
+#[test]
+fn postcard_struct_variant_with_state_override_round_trips() {
+    let value = VariantModes::WithOverride {
+        counter: CounterValue(93),
+    };
+
+    let ser_state = Recorder::default();
+    let bytes = postcard::to_allocvec(&serde_state::__private::wrap_serialize(
+        &value, &ser_state,
+    ))
+    .expect("postcard serialize variant with override");
+    assert_eq!(ser_state.serialized.get(), 1);
+
+    let de_state = Recorder::default();
+    let mut deserializer = postcard::Deserializer::from_bytes(&bytes);
+    let decoded = VariantModes::deserialize_state(&de_state, &mut deserializer)
+        .expect("postcard deserialize variant with override");
+    assert_eq!(decoded, value);
+    assert_eq!(de_state.deserialized.get(), 1);
+    assert_eq!(deserializer.finalize().expect("postcard remainder").len(), 0);
+}
