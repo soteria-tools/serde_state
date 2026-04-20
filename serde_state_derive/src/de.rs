@@ -8,7 +8,7 @@ use crate::{
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
-use syn::{parse_quote, Data, DeriveInput, GenericParam, Generics, Type};
+use syn::{Data, DeriveInput, GenericParam, Generics, Type, parse_quote};
 
 pub fn expand_derive_deserialize(input: &DeriveInput) -> syn::Result<TokenStream> {
     if let Data::Union(u) = &input.data {
@@ -253,6 +253,78 @@ fn deserialize_struct_body(
     }
 }
 
+fn deserialize_identifier_or_u32(deserializer: TokenStream, visitor: TokenStream) -> TokenStream {
+    quote! {
+        if _serde::Deserializer::is_human_readable(&#deserializer) {
+            _serde::Deserializer::deserialize_identifier(#deserializer, #visitor)
+        } else {
+            _serde::Deserializer::deserialize_u32(#deserializer, #visitor)
+        }
+    }
+}
+
+fn seq_read_fields_body(
+    fields: &[FieldDecl<'_>],
+    included: &[&FieldDecl<'_>],
+    state_tokens: &TokenStream,
+    explicit_state: Option<&Type>,
+    state_bound: Option<&Type>,
+    construct: TokenStream,
+) -> TokenStream {
+    let included_len = included.len();
+    let read_included = included.iter().enumerate().map(|(seq_index, field)| {
+        let ident = field.ident().unwrap();
+        let ty = field.ty();
+        let idx = seq_index;
+        if field.attrs.with.is_some() {
+            let seed = with_deserialize_seed(field, explicit_state, state_bound);
+            quote! {
+                let __seed = #seed;
+                let #ident = match _serde::de::SeqAccess::next_element_seed(&mut __seq, __seed)? {
+                    ::core::option::Option::Some(value) => value,
+                    ::core::option::Option::None =>
+                        return ::core::result::Result::Err(_serde::de::Error::invalid_length(#idx, &self)),
+                };
+            }
+        } else {
+            match field.mode() {
+                ItemMode::Stateful => quote! {
+                    let __seed = _serde_state::__private::wrap_deserialize_seed::<#ty, #state_tokens>(state);
+                    let #ident = match _serde::de::SeqAccess::next_element_seed(&mut __seq, __seed)? {
+                        ::core::option::Option::Some(value) => value,
+                        ::core::option::Option::None =>
+                            return ::core::result::Result::Err(_serde::de::Error::invalid_length(#idx, &self)),
+                    };
+                },
+                ItemMode::Stateless => quote! {
+                    let #ident = match _serde::de::SeqAccess::next_element::<#ty>(&mut __seq)? {
+                        ::core::option::Option::Some(value) => value,
+                        ::core::option::Option::None =>
+                            return ::core::result::Result::Err(_serde::de::Error::invalid_length(#idx, &self)),
+                    };
+                },
+            }
+        }
+    });
+    let init_skipped = fields.iter().filter(|field| field.attrs.skip).map(|field| {
+        let ident = field.ident().unwrap();
+        quote! {
+            let #ident = ::core::default::Default::default();
+        }
+    });
+    quote! {
+        let state = self.state;
+        #(#read_included)*
+        if let ::core::option::Option::Some(_) =
+            _serde::de::SeqAccess::next_element::<_serde::de::IgnoredAny>(&mut __seq)?
+        {
+            return ::core::result::Result::Err(_serde::de::Error::invalid_length(#included_len + 1, &self));
+        }
+        #(#init_skipped)*
+        ::core::result::Result::Ok(#construct)
+    }
+}
+
 fn deserialize_named_struct(
     ident: &syn::Ident,
     fields: &[FieldDecl<'_>],
@@ -294,12 +366,18 @@ fn deserialize_named_struct(
     };
 
     let field_visitor = {
+        let deserialize_field =
+            deserialize_identifier_or_u32(quote!(deserializer), quote!(__FieldVisitor));
         let match_arms = field_names
             .iter()
             .zip(field_variants.iter())
             .map(|(name, variant)| {
                 quote! { #name => ::core::result::Result::Ok(__Field::#variant) }
             });
+        let index_match_arms = field_variants.iter().enumerate().map(|(index, variant)| {
+            let index = index as u64;
+            quote! { #index => ::core::result::Result::Ok(__Field::#variant) }
+        });
         quote! {
             struct __FieldVisitor;
             impl<'de> _serde::de::Visitor<'de> for __FieldVisitor {
@@ -318,6 +396,23 @@ fn deserialize_named_struct(
                         _ => ::core::result::Result::Ok(__Field::__Ignore),
                     }
                 }
+
+                fn visit_u64<E>(self, value: u64) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    match value {
+                        #(#index_match_arms,)*
+                        _ => ::core::result::Result::Ok(__Field::__Ignore),
+                    }
+                }
+
+                fn visit_u32<E>(self, value: u32) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    self.visit_u64(value as u64)
+                }
             }
 
             impl<'de> _serde::Deserialize<'de> for __Field {
@@ -325,7 +420,7 @@ fn deserialize_named_struct(
                 where
                     D: _serde::Deserializer<'de>,
                 {
-                    deserializer.deserialize_identifier(__FieldVisitor)
+                    #deserialize_field
                 }
             }
         }
@@ -339,6 +434,23 @@ fn deserialize_named_struct(
             quote!(let mut #ident = ::core::option::Option::None;)
         }
     });
+
+    let construct = {
+        let pairs = fields.iter().map(|field| {
+            let ident = field.ident().unwrap();
+            quote!(#ident: #ident)
+        });
+        quote!(#ident { #(#pairs),* })
+    };
+
+    let seq_read_fields = seq_read_fields_body(
+        fields,
+        &included,
+        state_tokens,
+        explicit_state,
+        state_bound,
+        construct.clone(),
+    );
 
     let match_arms = included
         .iter()
@@ -398,14 +510,6 @@ fn deserialize_named_struct(
         }
     });
 
-    let construct = {
-        let pairs = fields.iter().map(|field| {
-            let ident = field.ident().unwrap();
-            quote!(#ident: #ident)
-        });
-        quote!(#ident { #(#pairs),* })
-    };
-
     let (visitor_struct_generics, _) =
         visitor_struct_generics_tokens(generics, include_state_param, state_bound);
     let (visitor_impl_generics, visitor_impl_type_generics) =
@@ -448,6 +552,13 @@ fn deserialize_named_struct(
                 }
                 #(#build_fields)*
                 ::core::result::Result::Ok(#construct)
+            }
+
+            fn visit_seq<__A>(self, mut __seq: __A) -> ::core::result::Result<Self::Value, __A::Error>
+            where
+                __A: _serde::de::SeqAccess<'de>,
+            {
+                #seq_read_fields
             }
         }
     };
@@ -821,12 +932,18 @@ fn deserialize_enum_body(
     };
 
     let variant_visitor = {
+        let deserialize_variant =
+            deserialize_identifier_or_u32(quote!(deserializer), quote!(__VariantVisitor));
         let match_arms = variant_names
             .iter()
             .zip(variant_idents.iter())
             .map(|(name, ident)| {
                 quote! { #name => ::core::result::Result::Ok(__Variant::#ident) }
             });
+        let index_match_arms = variant_idents.iter().enumerate().map(|(index, ident)| {
+            let index = index as u64;
+            quote! { #index => ::core::result::Result::Ok(__Variant::#ident) }
+        });
         quote! {
             struct __VariantVisitor;
             impl<'de> _serde::de::Visitor<'de> for __VariantVisitor {
@@ -845,6 +962,26 @@ fn deserialize_enum_body(
                         _ => ::core::result::Result::Err(_serde::de::Error::unknown_variant(value, __VARIANTS)),
                     }
                 }
+
+                fn visit_u64<E>(self, value: u64) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    match value {
+                        #(#index_match_arms,)*
+                        _ => ::core::result::Result::Err(_serde::de::Error::invalid_value(
+                            _serde::de::Unexpected::Unsigned(value),
+                            &self,
+                        )),
+                    }
+                }
+
+                fn visit_u32<E>(self, value: u32) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    self.visit_u64(value as u64)
+                }
             }
 
             impl<'de> _serde::Deserialize<'de> for __Variant {
@@ -852,7 +989,7 @@ fn deserialize_enum_body(
                 where
                     D: _serde::Deserializer<'de>,
                 {
-                    deserializer.deserialize_identifier(__VariantVisitor)
+                    #deserialize_variant
                 }
             }
         }
@@ -1193,12 +1330,18 @@ fn struct_variant_helpers(
 
     let field_visitor_ident = format_ident!("__VariantFieldVisitor_{}", variant_ident);
     let field_visitor = {
+        let deserialize_field =
+            deserialize_identifier_or_u32(quote!(deserializer), quote!(#field_visitor_ident));
         let match_arms = field_names
             .iter()
             .zip(field_variants.iter())
             .map(|(name, variant)| {
                 quote! { #name => ::core::result::Result::Ok(#field_enum_ident::#variant) }
             });
+        let index_match_arms = field_variants.iter().enumerate().map(|(index, variant)| {
+            let index = index as u64;
+            quote! { #index => ::core::result::Result::Ok(#field_enum_ident::#variant) }
+        });
         quote! {
             #[allow(non_camel_case_types)]
             struct #field_visitor_ident;
@@ -1218,6 +1361,23 @@ fn struct_variant_helpers(
                         _ => ::core::result::Result::Ok(#field_enum_ident::__Ignore),
                     }
                 }
+
+                fn visit_u64<E>(self, value: u64) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    match value {
+                        #(#index_match_arms,)*
+                        _ => ::core::result::Result::Ok(#field_enum_ident::__Ignore),
+                    }
+                }
+
+                fn visit_u32<E>(self, value: u32) -> ::core::result::Result<Self::Value, E>
+                where
+                    E: _serde::de::Error,
+                {
+                    self.visit_u64(value as u64)
+                }
             }
 
             impl<'de> _serde::Deserialize<'de> for #field_enum_ident {
@@ -1225,7 +1385,7 @@ fn struct_variant_helpers(
                 where
                     D: _serde::Deserializer<'de>,
                 {
-                    deserializer.deserialize_identifier(#field_visitor_ident)
+                    #deserialize_field
                 }
             }
         }
@@ -1239,6 +1399,20 @@ fn struct_variant_helpers(
             quote!(let mut #ident = ::core::option::Option::None;)
         }
     });
+
+    let construct = {
+        let pairs = field_idents.iter().map(|ident| quote!(#ident: #ident));
+        quote!(#ident::#variant_ident { #(#pairs),* })
+    };
+
+    let seq_read_fields = seq_read_fields_body(
+        fields,
+        &included,
+        state_tokens,
+        explicit_state,
+        state_bound,
+        construct.clone(),
+    );
 
     let match_arms = included
         .iter()
@@ -1298,11 +1472,6 @@ fn struct_variant_helpers(
         }
     });
 
-    let construct = {
-        let pairs = field_idents.iter().map(|ident| quote!(#ident: #ident));
-        quote!(#ident::#variant_ident { #(#pairs),* })
-    };
-
     let (visitor_struct_generics, _) =
         visitor_struct_generics_tokens(generics, include_state_param, state_bound);
     let (visitor_impl_generics, visitor_impl_type_generics) =
@@ -1350,6 +1519,13 @@ fn struct_variant_helpers(
                 }
                 #(#build_fields)*
                 ::core::result::Result::Ok(#construct)
+            }
+
+            fn visit_seq<__A>(self, mut __seq: __A) -> ::core::result::Result<Self::Value, __A::Error>
+            where
+                __A: _serde::de::SeqAccess<'de>,
+            {
+                #seq_read_fields
             }
         }
     };
